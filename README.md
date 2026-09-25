@@ -36,15 +36,20 @@ measured worst TTFR is **584.0 s**: each prefill runs to completion before the n
 begins. Prefill rate itself is flat (~1,850 tok/s) at every concurrency level; single
 stream at depth 0 manages 2,453 tok/s only because it has no queue behind it.
 
-**This is tunable.** `LPT` (`--long-prefill-token-threshold`) is unset in
-`config/R-baseline.env`, so a long prefill takes the entire per-step budget and cannot
-be interleaved. Setting it below `MNBT` chunks long prefills and spreads first-token
-latency across requests instead of stacking it. Total prefill work is unchanged, so
-aggregate throughput will not improve — but request 16 stops waiting nine minutes. See
-[`docs/CONFIG.md`](docs/CONFIG.md).
+**This is very likely tunable — and worth testing on your hardware.** `LPT`
+(`--long-prefill-token-threshold`) is unset in `config/R-baseline.env`, so a long prefill
+receives the entire per-step budget and cannot be interleaved. The scheduler caps new
+prefill tokens per step at `min(MNBT, LPT)`, so setting `LPT` below `MNBT` should chunk
+long prefills and spread first-token latency rather than stacking it.
+
+To be explicit about the limits of what we measured: the serialisation and the TTFR
+spread above are measured; **the fix is inferred, not measured at this concurrency and
+depth.** The mechanism is from the scheduler implementation, and `LPT=1024` was measured
+on this stack cutting worst-case short-request latency during a 100K prefill from 39.9 s
+to 1.9 s — a different scenario. If you set `LPT`, re-measure.
 
 **Practical guidance:** size a long-context deployment by stream count, not aggregate
-throughput, and pick `LPT` deliberately for your latency profile.
+throughput, and set `LPT` deliberately for your latency profile.
 
 **Prefill and decode vs context depth** (single stream, 3 runs each):
 

@@ -49,12 +49,19 @@ Each request's prefill runs to completion before the next begins, so request *N*
 `N × ~36 s` for its first token. Prefill *rate* is unaffected — 1,852–1,881 tok/s at
 every concurrency level — it is prefill *concurrency* that is absent.
 
-**This is a tunable, not an engine limit.** `LPT` is unset in `config/R-baseline.env`,
-so a long prefill receives the whole per-step budget (`min(MNBT, LPT)` = `MNBT`) and
-cannot be interleaved with other requests. Setting `LPT` below `MNBT` chunks long
-prefills and spreads first-token latency instead of stacking it. Total prefill work is
-unchanged, so aggregate throughput will not improve — but head-of-line blocking goes
-away. Anyone deploying long context should set `LPT` deliberately and re-measure.
+**This is probably a tunable, not an engine limit — but we did not test it here.**
+`LPT` is unset in `config/R-baseline.env`, so a long prefill receives the whole per-step
+budget (`min(MNBT, LPT)` = `MNBT`) and cannot be interleaved with other requests. Setting
+`LPT` below `MNBT` should chunk long prefills and spread first-token latency instead of
+stacking it; total prefill work is unchanged either way, so aggregate throughput should
+not move.
+
+What is **measured** is the serialisation, the TTFR spread, and the flat prefill rate.
+What is **inferred** is that `LPT` removes the head-of-line blocking — the reasoning comes
+from the scheduler implementation plus a separate measurement on this stack where
+`LPT=1024` cut worst-case short-request latency during a 100K prefill from 39.9 s to
+1.9 s. That is a different workload from 16 concurrent 64K requests, so treat the fix as
+untested here and re-measure if you set it.
 
 Single-stream 64K decode (43.31) is slightly above depth 0 (41.69): context on its own
 costs nothing. What costs is a *queue* of long-context requests behind it.
