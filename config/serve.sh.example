@@ -1,0 +1,18 @@
+#!/bin/bash
+set -euo pipefail
+vllm serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+    --served-model-name deepseek-ai/DeepSeek-V4-Flash-Vision-Exp deepseek-v4-flash \
+    --host 0.0.0.0 --port 8000 \
+    --trust-remote-code --revision 86f746b36186f0e567729a5c06a8c918caba82a9 --tokenizer-revision 86f746b36186f0e567729a5c06a8c918caba82a9 --code-revision 86f746b36186f0e567729a5c06a8c918caba82a9 \
+    --tensor-parallel-size 2 \
+    --kv-cache-dtype fp8 --block-size 256 \
+    --max-model-len 1048576 --max-num-seqs 16 --max-num-batched-tokens 2048 \
+    --gpu-memory-utilization 0.88 \
+    --enable-prefix-caching --enable-chunked-prefill --enable-prompt-tokens-details \
+    --skip-mm-profiling --limit-mm-per-prompt '{"image": 8}' \
+    --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}' \
+    --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"high"}' --override-generation-config '{"temperature":1.0,"top_p":0.95}' \
+    --moe-backend b12x --linear-backend b12x --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64],"custom_ops":["all"]}'   --hf-overrides '{"mm_prefix_span_leading_pad_modulus":4,"mm_prefix_clamp_sliding_window":true}' \
+    --speculative-config '{"method":"dspark","model":"deepseek-ai/DeepSeek-V4-Flash-Vision-Exp","num_speculative_tokens":3,"draft_sample_method":"probabilistic","attention_backend":"FLASHINFER_MLA_SPARSE_DSV4","enable_adaptive_verification":false,"revision":"86f746b36186f0e567729a5c06a8c918caba82a9","code_revision":"86f746b36186f0e567729a5c06a8c918caba82a9"}'

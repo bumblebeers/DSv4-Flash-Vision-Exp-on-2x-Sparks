@@ -124,3 +124,80 @@ Reproduce the exact command for any boot from its record:
 ```
 ~/stack029/records/<timestamp>__<profile>/serve.sh
 ```
+
+---
+
+## Settings we investigated before publishing
+
+Three things in the launch command are non-obvious. Each was traced to the source in
+the image, because guessing on a forum thread is worse than saying "we checked".
+
+### `--block-size 256` does not set the effective block size
+
+The engine reports `block_size=4` while accepting `--block-size 256`. Not a bug and not
+a silent clamp — the effective value is computed after argument parsing:
+
+```python
+# vllm/v1/engine/core.py:345
+participating = [g.kv_cache_spec.block_size for g in kv_cache_groups
+                 if g.kv_cache_spec.prefix_cacheable]
+vllm_config.cache_config.block_size = min(participating or [...])
+```
+
+The block size is the **minimum across all prefix-cacheable KV-cache groups**. This
+model's group sizes are hardcoded, fixed by tensor sharing between compressor state and
+KV blocks:
+
+| Group | `block_size` | Why |
+|---|---:|---|
+| C4 compressor (`compress_ratio=4`) | **4** | C4 block shape `[4, 2*512*2*4]` |
+| C128 compressor (`compress_ratio=128`) | 8 | C128 block shape `[8, 512*2*4]` |
+| SWA | 64 | shares a page with the C4A KV blocks |
+
+`min(4, 8, 64) = 4`. Both source sites carry the same note: *"TODO(yifan): make block
+size automatically determined and configurable."*
+
+The model's KV block shape is hardcoded as `[256//4, head_dim] = [64, 584]`, so `256`
+appears to be a structural constant of the architecture rather than an arbitrary flag.
+**We verified that the reported block size is the group minimum; we did not verify
+whether `--block-size 256` is load-bearing for coherence with those hardcoded shapes.**
+It is inherited from the vendor sample, not a value we chose.
+
+### The empty reasoning strings are intentional
+
+```
+--reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}'
+```
+
+Empty looks wrong but is the correct encoding for "let the parser decide". The config
+only *fills in* a string when its own is falsy:
+
+```python
+# vllm/config/reasoning.py:88
+start_token = reasoning_parser.reasoning_start_str
+if start_token and not reasoning_start_str:      # "" is falsy -> parser wins
+    reasoning_start_str = start_token
+```
+
+and the `deepseek_v4` parser hardcodes its delimiters:
+
+```python
+# vllm/parser/deepseek_v4.py:43
+DSML_THINK_START = "<think>"
+DSML_THINK_END   = "</think>"
+```
+
+So thinking is delimited by `<think>` / `</think>`, supplied by the parser. Passing
+non-empty strings here would **override** the parser, not enable anything.
+
+### Inherited engine flags, and one that is load-bearing
+
+| Flag | What it does | Provenance |
+|---|---|---|
+| `--skip-mm-profiling` | Omits the multimodal encoder from the memory-profiling pass, so the KV pool is not reduced by the vision encoder's peak. A capacity/margin trade — this is part of why the pool reaches 3.86 M tokens. | vendor sample |
+| `--enable-prompt-tokens-details` | Adds the prompt-token breakdown to `usage`, which is where `multimodal_tokens` comes from — useful for confirming a model actually conditioned on an image. | vendor sample |
+| `VLLM_USE_V2_MODEL_RUNNER=1` | Selects the V2 model runner (tri-state in `envs.py`; `1` forces it on). **This is load-bearing for our vision fix** — the overlay patches `vllm/v1/worker/gpu/model_states/default.py`, a V2-runner file. Turning it off would silently disable the mm-prefix-span repair. | image |
+| `VLLM_USE_BREAKABLE_CUDAGRAPH=1` | Enables `compilation/breakable_cudagraph.py` (default `False`). Boot log confirms `Breakable CUDA graph enabled`. | image |
+
+`config/serve.sh.example` is the fully rendered engine command from a working boot, so
+you can diff it against your own without standing the stack up first.
