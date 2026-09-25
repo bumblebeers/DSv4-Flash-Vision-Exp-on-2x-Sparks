@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Per-node launch records are generated at runtime, not tracked.
+records/
+
+# Local site overrides (hostnames, addresses) — keep out of the repo.
+config/*.local.env

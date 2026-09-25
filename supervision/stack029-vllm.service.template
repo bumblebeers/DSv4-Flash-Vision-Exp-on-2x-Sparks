@@ -1,0 +1,44 @@
+# stack029-vllm.service — systemd supervision for the stack029 DSv4-Flash-Vision-Exp
+# cluster serve (2x Spark TP=2, gated launcher, eugr launch-cluster.sh). Installed on the
+# HEAD node by supervision/install.sh, which renders __USER__/__HOME__ below.
+# Owner request 2026-09-12: serve the adopted K-ours-opt profile as an appliance — auto-start
+# at boot, relaunch on death. Same shape as dsv4-vllm.service (0731) and vision-vllm.service.
+#
+# The service process is the LAUNCHER (stack029-launch.sh serve): it adopts an
+# already-healthy pair or runs the full gated start (preflight -> render -> launch ->
+# /health -> record -> 5-gate battery), then monitors /health, the worker container and
+# engine progress in the foreground. Exit 2 = died/wedged -> Restart=on-failure after 180 s;
+# 5 restarts per 2 h max (StartLimit) so a persistent condition (bad clocks, repeated gate
+# failure) stops the flapping and needs an operator. journalctl -u stack029-vllm tells.
+#
+# The launcher owns start/stop of the PAIR via launch-cluster.sh (the recipe sets no
+# container restart policy, so independent dockerd restarts cannot split a TP=2 pair).
+# Conflicts= keeps the superseded 0731 / vision units from ever co-running (same port,
+# same memory). Switching the enshrined config = change the profile path in ExecStart
+# (or repoint a symlink) + systemctl restart stack029-vllm.
+
+[Unit]
+Description=DeepSeek-V4-Flash-Vision-Exp stack029 cluster serving (2x Spark TP2, gated launcher)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+Conflicts=dsv4-vllm.service vision-vllm.service
+StartLimitIntervalSec=7200
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=__USER__
+WorkingDirectory=__HOME__/stack029
+Environment=HOME=__HOME__
+ExecStart=__HOME__/stack029/stack029-launch.sh serve __HOME__/stack029/profiles/R-baseline.env
+ExecStop=__HOME__/stack029/stack029-launch.sh stop
+Restart=on-failure
+RestartSec=180
+TimeoutStopSec=300
+# Launcher output (launch facts, gate verdicts, monitor warnings) -> journal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
