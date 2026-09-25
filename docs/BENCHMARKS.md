@@ -22,17 +22,26 @@ KV pool **3,785,457 tokens**.
 
 ## Throughput vs concurrency
 
-Depth 0, pp 2048 / tg 128, 3 runs per point.
+pp 2048 / tg 128, 3 runs per point, at two context depths.
 
-| Streams | Aggregate tok/s | Per stream | Peak tok/s | TTFR | Prefill tok/s |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 41.69 | 41.69 | 52.0 | 1,062 ms | 2,453 |
-| 2 | 58.72 | 29.36 | 75.7 | 1,911 ms | 1,915 |
-| 4 | 60.45 | 15.11 | 110.7 | 3,196 ms | 1,917 |
-| 8 | 73.56 | 9.20 | 161.7 | 5,470 ms | 1,929 |
-| 16 | **80.97** | 5.06 | **230.0** | 9,659 ms | 1,933 |
+| Streams | Depth 0 agg | Depth 0 per-stream | Depth 0 TTFR | 64K agg | 64K per-stream | 64K TTFR |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 41.69 | 41.69 | 1.06 s | 43.31 | 43.31 | 36.1 s |
+| 2 | 58.72 | 29.36 | 1.91 s | 6.56 | 3.28 | 54.7 s |
+| 4 | 60.45 | 15.11 | 3.20 s | 4.55 | 1.14 | 91.2 s |
+| 8 | 73.56 | 9.20 | 5.47 s | 3.94 | 0.49 | 164.3 s |
+| 16 | 80.97 | 5.06 | 9.66 s | 3.69 | 0.23 | 310.5 s |
 
-Aggregate scaling is sub-linear past 4 streams; peak throughput at 16 streams is 230 tok/s.
+**Concurrency helps at short context and destroys throughput at long context.** At depth
+0, 16 streams give 1.94× single-stream throughput. At 64K the same 16 streams give
+**0.085×** — a 12× collapse, and most of the damage is done by the *second* stream
+(43.31 → 6.56). Prefill throughput is flat across every level (1,852–1,881 tok/s at 64K),
+so the engine is not prefill-bound; decode is starved because long prefills hold the
+scheduler.
+
+Single-stream 64K decode (43.31) is slightly *higher* than depth 0 (41.69). Adding
+context costs nothing on its own; adding a *concurrent* long-context stream costs
+almost everything.
 
 ## Throughput vs context depth
 

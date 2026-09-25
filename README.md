@@ -14,15 +14,23 @@ should be able to stand the stack up.
 Measured on 2× DGX Spark (GB10, 128 GB unified each) over the direct 200 Gb/s link.
 Client on a third machine; nothing benchmarked on the servers themselves.
 
-**Decode throughput vs concurrency** (depth 0, pp 2048 / tg 128, 3 runs each):
+**Decode throughput vs concurrency** (pp 2048 / tg 128, 3 runs each). Concurrency is a
+trap at long context — at depth 0 it nearly doubles throughput, at 64K it collapses it
+by 12×:
 
-| Concurrent streams | Aggregate tok/s | Per stream | Peak tok/s | TTFR |
-|---:|---:|---:|---:|---:|
-| 1 | **41.7** | 41.7 | 52 | 1.06 s |
-| 2 | 58.7 | 29.4 | 76 | 1.91 s |
-| 4 | 60.5 | 15.1 | 111 | 3.20 s |
-| 8 | 73.6 | 9.2 | 162 | 5.47 s |
-| 16 | **81.0** | 5.1 | **230** | 9.66 s |
+| Streams | Depth 0 agg tok/s | Depth 0 per-stream | 64K agg tok/s | 64K per-stream | 64K TTFR |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 41.7 | 41.7 | **43.3** | 43.3 | 36.1 s |
+| 2 | 58.7 | 29.4 | 6.6 | 3.3 | 54.7 s |
+| 4 | 60.5 | 15.1 | 4.6 | 1.1 | 91.2 s |
+| 8 | 73.6 | 9.2 | 3.9 | 0.5 | 164.3 s |
+| 16 | **81.0** | 5.1 | 3.7 | 0.2 | 310.5 s |
+
+Note the second column against the fourth: one stream at 64K context is *faster* than
+one stream with no context, yet a second concurrent stream at that depth costs 85 % of
+the throughput. Prefill rate is unaffected (~1,850 tok/s at every level) — it is decode
+that gets starved, because long prefills monopolise the scheduler. **Size a
+long-context deployment by stream count, not by aggregate throughput.**
 
 **Prefill and decode vs context depth** (single stream, 3 runs each):
 
