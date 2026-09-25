@@ -22,26 +22,42 @@ KV pool **3,785,457 tokens**.
 
 ## Throughput vs concurrency
 
-pp 2048 / tg 128, 3 runs per point, at two context depths.
+pp 2048 / tg 128, 3 runs per point, at two context depths. **Read peak, not aggregate** —
+see the note below.
 
-| Streams | Depth 0 agg | Depth 0 per-stream | Depth 0 TTFR | 64K agg | 64K per-stream | 64K TTFR |
+| Streams | Depth 0 agg | Depth 0 peak | Depth 0 TTFR | 64K agg | 64K peak | 64K TTFR |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 41.69 | 41.69 | 1.06 s | 43.31 | 43.31 | 36.1 s |
-| 2 | 58.72 | 29.36 | 1.91 s | 6.56 | 3.28 | 54.7 s |
-| 4 | 60.45 | 15.11 | 3.20 s | 4.55 | 1.14 | 91.2 s |
-| 8 | 73.56 | 9.20 | 5.47 s | 3.94 | 0.49 | 164.3 s |
-| 16 | 80.97 | 5.06 | 9.66 s | 3.69 | 0.23 | 310.5 s |
+| 1 | 41.69 | 52.0 | 1.06 s | 43.31 | 50.7 | 36.1 s |
+| 2 | 58.72 | 75.7 | 1.91 s | 6.56 | 73.0 | 37.0 – 72.5 s |
+| 4 | 60.45 | 110.7 | 3.20 s | 4.55 | 77.0 | 37.0 – 145.3 s |
+| 8 | 73.56 | 161.7 | 5.47 s | 3.94 | 74.0 | 37.1 – 291.5 s |
+| 16 | 80.97 | 230.0 | 9.66 s | 3.69 | 74.3 | 37.2 – 584.0 s |
 
-**Concurrency helps at short context and destroys throughput at long context.** At depth
-0, 16 streams give 1.94× single-stream throughput. At 64K the same 16 streams give
-**0.085×** — a 12× collapse, and most of the damage is done by the *second* stream
-(43.31 → 6.56). Prefill throughput is flat across every level (1,852–1,881 tok/s at 64K),
-so the engine is not prefill-bound; decode is starved because long prefills hold the
-scheduler.
+### How to read this
 
-Single-stream 64K decode (43.31) is slightly *higher* than depth 0 (41.69). Adding
-context costs nothing on its own; adding a *concurrent* long-context stream costs
-almost everything.
+**Decode capability scales with concurrency at both depths.** Peak decode throughput at
+64K rises 50.7 → 77.0 tok/s and saturates near 4 streams. The engine is not decode-limited.
+
+**The 64K aggregate is low because the cell is prefill-dominated.** At 16 streams the
+cell carries 1.08 M prefill tokens and 2 K decode tokens — roughly 95 % prefill. An
+aggregate figure computed over the cell's wall clock therefore reports mostly the
+prefill, not the decode.
+
+**Prefills serialise completely at this configuration.** The arithmetic is exact:
+`16 × 67,584 ÷ 1,852 tok/s = 583.9 s`, against a measured worst TTFR of **584.0 s**.
+Each request's prefill runs to completion before the next begins, so request *N* waits
+`N × ~36 s` for its first token. Prefill *rate* is unaffected — 1,852–1,881 tok/s at
+every concurrency level — it is prefill *concurrency* that is absent.
+
+**This is a tunable, not an engine limit.** `LPT` is unset in `config/R-baseline.env`,
+so a long prefill receives the whole per-step budget (`min(MNBT, LPT)` = `MNBT`) and
+cannot be interleaved with other requests. Setting `LPT` below `MNBT` chunks long
+prefills and spreads first-token latency instead of stacking it. Total prefill work is
+unchanged, so aggregate throughput will not improve — but head-of-line blocking goes
+away. Anyone deploying long context should set `LPT` deliberately and re-measure.
+
+Single-stream 64K decode (43.31) is slightly above depth 0 (41.69): context on its own
+costs nothing. What costs is a *queue* of long-context requests behind it.
 
 ## Throughput vs context depth
 
@@ -61,23 +77,26 @@ Single stream, pp 2048 / tg 128, 3 runs per point.
 **Decode is essentially context-independent to 262K.** Prefill degrades roughly linearly.
 A 512K-token prompt costs 7.1 minutes to first token.
 
-## Depth × concurrency
+## Depth × concurrency (independent grid)
 
-2 runs per cell. This is the table that matters for planning long-context serving.
+A separate 2-run grid at intermediate depths, to check the trend between the two points
+above. Same picture: aggregate falls as streams rise, while per-request first-token
+latency stacks.
 
-| Depth | Streams | Aggregate decode tok/s | Per stream | TTFR |
-|---:|---:|---:|---:|---:|
-| 16,384 | 4 | 15.46 | 3.87 | 24.8 s |
-| 16,384 | 8 | 14.03 | 1.75 | 44.3 s |
-| 16,384 | 16 | 13.44 | 0.84 | 83.2 s |
-| 65,536 | 4 | 3.94 | 0.99 | 93.4 s |
-| 65,536 | 8 | 3.85 | 0.48 | 167.6 s |
-| 65,536 | 16 | 3.61 | 0.23 | **317.4 s** |
+| Depth | Streams | Aggregate decode tok/s | TTFR |
+|---:|---:|---:|---:|
+| 16,384 | 4 | 15.46 | 24.8 s |
+| 16,384 | 8 | 14.03 | 44.3 s |
+| 16,384 | 16 | 13.44 | 83.2 s |
+| 65,536 | 4 | 3.94 | 93.4 s |
+| 65,536 | 8 | 3.85 | 167.6 s |
+| 65,536 | 16 | 3.61 | **317.4 s** |
 
-**Concurrency stops helping at depth.** At depth 0, 16 streams nearly double aggregate
-throughput (41.7 → 81.0 tok/s). At 64K it *inverts*: aggregate falls to ~3.6 tok/s and
-adding streams only adds latency, because prefills serialise. Plan long-context capacity
-by stream count, not by aggregate throughput.
+The TTFR growth is the signal: 16,384 × 16 gives 83 s, 65,536 × 16 gives 317 s, and the
+full-range run above reaches 584 s at the same stream count. Latency scales with the
+*total prefill queued ahead of a request*, which is `streams × depth` — the definition of
+head-of-line blocking. Note this grid predates the `--context-size` correction, so treat
+its absolute numbers as indicative and the trend as the finding.
 
 ## Quality
 

@@ -14,23 +14,37 @@ should be able to stand the stack up.
 Measured on 2× DGX Spark (GB10, 128 GB unified each) over the direct 200 Gb/s link.
 Client on a third machine; nothing benchmarked on the servers themselves.
 
-**Decode throughput vs concurrency** (pp 2048 / tg 128, 3 runs each). Concurrency is a
-trap at long context — at depth 0 it nearly doubles throughput, at 64K it collapses it
-by 12×:
+**Decode throughput vs concurrency** (pp 2048 / tg 128, 3 runs each). Concurrency scales
+decode well at short context. At 64K the cost is not decode — it is that **prefills
+serialise**, so every request waits for the one before it to finish prefilling:
 
-| Streams | Depth 0 agg tok/s | Depth 0 per-stream | 64K agg tok/s | 64K per-stream | 64K TTFR |
+| Streams | Depth 0 agg tok/s | Depth 0 peak | 64K agg tok/s | 64K peak | 64K TTFR (first→last req) |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 41.7 | 41.7 | **43.3** | 43.3 | 36.1 s |
-| 2 | 58.7 | 29.4 | 6.6 | 3.3 | 54.7 s |
-| 4 | 60.5 | 15.1 | 4.6 | 1.1 | 91.2 s |
-| 8 | 73.6 | 9.2 | 3.9 | 0.5 | 164.3 s |
-| 16 | **81.0** | 5.1 | 3.7 | 0.2 | 310.5 s |
+| 1 | 41.7 | 52 | 43.3 | 51 | 36 s |
+| 2 | 58.7 | 76 | 6.6 | 73 | 37 – 73 s |
+| 4 | 60.5 | 111 | 4.6 | 77 | 37 – 145 s |
+| 8 | 73.6 | 162 | 3.9 | 74 | 37 – 292 s |
+| 16 | **81.0** | **230** | 3.7 | 74 | 37 – **584 s** |
 
-Note the second column against the fourth: one stream at 64K context is *faster* than
-one stream with no context, yet a second concurrent stream at that depth costs 85 % of
-the throughput. Prefill rate is unaffected (~1,850 tok/s at every level) — it is decode
-that gets starved, because long prefills monopolise the scheduler. **Size a
-long-context deployment by stream count, not by aggregate throughput.**
+Read the **peak** column, not the aggregate. Peak decode throughput *rises* with
+concurrency at 64K too (51 → 77 tok/s, saturating near 4 streams) — the engine decodes
+fine. The aggregate is low because a 64K cell is ~95 % prefill: 16 requests carry
+1.08 M prefill tokens against 2 K decode tokens.
+
+The serialisation is exact. `16 × 67,584 tokens ÷ 1,852 tok/s = 583.9 s`, and the
+measured worst TTFR is **584.0 s**: each prefill runs to completion before the next
+begins. Prefill rate itself is flat (~1,850 tok/s) at every concurrency level; single
+stream at depth 0 manages 2,453 tok/s only because it has no queue behind it.
+
+**This is tunable.** `LPT` (`--long-prefill-token-threshold`) is unset in
+`config/R-baseline.env`, so a long prefill takes the entire per-step budget and cannot
+be interleaved. Setting it below `MNBT` chunks long prefills and spreads first-token
+latency across requests instead of stacking it. Total prefill work is unchanged, so
+aggregate throughput will not improve — but request 16 stops waiting nine minutes. See
+[`docs/CONFIG.md`](docs/CONFIG.md).
+
+**Practical guidance:** size a long-context deployment by stream count, not aggregate
+throughput, and pick `LPT` deliberately for your latency profile.
 
 **Prefill and decode vs context depth** (single stream, 3 runs each):
 
