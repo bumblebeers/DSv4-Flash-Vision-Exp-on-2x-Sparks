@@ -12,13 +12,19 @@ KV pool **3,785,457 tokens**.
 - Endpoint `http://<head>:8000/v1`, model `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`.
 - Tools pinned: [llama-benchy](https://github.com/eugr/llama-benchy) `0.4.0`,
   [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) `v2.7.0`.
-- llama-benchy corpus: Project Gutenberg *Complete Works of Shakespeare* (pg100),
-  **1,832,549 tokens**. The tool's default corpus is only 142,813 tokens, which caps
-  `--depth` far below this model's context.
+- llama-benchy corpus: Project Gutenberg *Complete Works of Shakespeare*
+  (`https://www.gutenberg.org/cache/epub/100/pg100.txt`). The tool's **default** corpus is
+  Sherlock Holmes at **142,813 tokens**, which caps `--depth` far below this model's
+  context — always check the `Total tokens available in text corpus` line in your own run.
+  Note the reported count for the same file is **not stable between runs** (we observed
+  both 1.47 M and 1.83 M); treat it as "large enough", not as a fixed figure.
 - Tokenizer verified as the real one — the tool silently falls back to `gpt2` otherwise,
   which invalidates every throughput figure. Warm-up delta on this model:
   `Server: 105, Local: 22`.
-- `--latency-mode generation`, `--skip-coherence`, 3 runs per cell unless stated.
+- Unless stated, runs use `--latency-mode generation --skip-coherence` and 3 runs per cell.
+  The 64K concurrency sweep is additionally reproduced with **vendor-default flags only**
+  (no `--runs`, `--latency-mode api`, coherence test enabled, default corpus) — see the
+  reproducibility note under that table.
 
 ## Throughput vs concurrency
 
@@ -65,6 +71,34 @@ untested here and re-measure if you set it.
 
 Single-stream 64K decode (43.31) is slightly above depth 0 (41.69): context on its own
 costs nothing. What costs is a *queue* of long-context requests behind it.
+
+### Reproduced with vendor-default flags
+
+This sweep was run twice: once with our flags (`--latency-mode generation`,
+`--skip-coherence`, the 1.5 M-token Shakespeare corpus) and once with **only** the flags
+a reader would use by default (no `--runs`, `--latency-mode api`, coherence test enabled,
+the tool's 142,813-token default corpus). Nothing else differed.
+
+| Streams | Aggregate (ours) | Aggregate (defaults) | Peak (ours) | Peak (defaults) | TTFR (ours) | TTFR (defaults) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 43.31 | **48.71** | 50.7 | 55.0 | 36.1 s | 36.8 s |
+| 2 | 6.56 | 6.44 | 73.0 | 75.0 | 54.7 s | 56.0 s |
+| 4 | 4.55 | 4.52 | 77.0 | 70.7 | 91.2 s | 92.2 s |
+| 8 | 3.94 | 3.88 | 74.0 | 74.3 | 164.3 s | 166.7 s |
+| 16 | 3.69 | 3.67 | 74.3 | 66.3 | 310.5 s | 312.1 s |
+
+**Every concurrency point reproduces within ~2 %.** The serialisation arithmetic holds in
+both: at 16 streams, `16 × 67,584 ÷ 1,852 = 583.9 s` predicted against 584.0 s and 588.4 s
+measured.
+
+The one real difference is single-stream: **43.31 → 48.71 (+12 %)**, and it is a *corpus*
+effect, not a flag effect. A different corpus is different text, and DSpark's speculative
+acceptance is content-dependent — we measured acceptance varying from 46.5 % (code) to
+69.9 % (structured) on the same model. Single-stream decode on this stack should be quoted
+as "≈45 tok/s, content-dependent", not as a precise figure.
+
+The conclusion — that concurrency does not help at depth, because prefills serialise — is
+not an artifact of benchmark flags.
 
 ## Throughput vs context depth
 
