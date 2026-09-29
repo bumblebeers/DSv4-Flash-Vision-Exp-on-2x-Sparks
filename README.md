@@ -1,221 +1,153 @@
 # DeepSeek-V4-Flash-Vision-Exp on 2× DGX Spark (GB10)
 
-Serve a 305B-parameter MoE with **1,048,576-token context** and native image input
-across two NVIDIA DGX Sparks at tensor-parallel 2 over a direct ConnectX link.
+Serve the **DeepSeek-V4-Flash-Vision-Exp** MoE — 305 B parameters, native image input, and a
+**1,048,576-token context** — across two NVIDIA DGX Spark (GB10) appliances at tensor
+parallelism 2, over a direct 200 Gb/s ConnectX-7 RoCE link.
 
-This repo is the whole deployment: pinned image, serving config, supervisor, the
-patches this stack needs, and a verification battery. Point an agent at it and it
-should be able to stand the stack up.
+This repo is the whole deployment: the pinned serving image, the serving configuration with
+every knob and the reason it is set that way, the two code patches this stack needs, a
+supervisor that runs a five-gate verification battery before it will call the server up, and
+the benchmark methodology and results.
 
----
+## How this stack differs
+
+Several public ways exist to run the DSv4-Flash family on a two-node Spark cluster. Most
+target the earlier text-only releases (`V4-Flash`, `V4-Flash-0731`); this one targets
+**Vision-Exp** and is set up so the vision is correct, not merely served.
+
+| | **This repo** | MiaAI-Lab packet | eugr/spark-vllm-docker | Ollie | GPDev |
+|---|---|---|---|---|---|
+| Model | **Vision-Exp** | V4-Flash (text) | V4-Flash / -0731 / -Vision-Exp | Vision-Exp | Vision-Exp |
+| Engine | `0rand/vllm_spark_dsv4-0.29-b12x` (vLLM 0.28.1rc1.dev475) | `ghcr.io/anemll/…` (vLLM 0.25.2) | built from source | same 0rand image + hot patches | prebuilt image |
+| Spatial-vision fix | **in-repo overlay + flags** | — | recipe currently broken | hot-patch mod | — |
+| KV pool | **4.68 M tokens** (4.47× full context) | shorter | varies | 1M | 1M |
+| Health verification | **5-gate battery** on every start | — | — | partial | preflight |
+| Thermal / fan handling | **documented + curve** | — | — | — | — |
+| License | MIT | MIT | MIT | none | none |
+
+**The vision fix is the load-bearing difference.** The model's native vision works for
+describe / OCR out of the box, but vLLM's V2 model runner has a defect in
+`compute_mm_prefix_ranges` that makes *spatial* prediction collapse: image rows leak into
+causal attention, so the model pins every predicted y-coordinate to the image centre
+(measured y-slope 0.287, 19 % mean error). This repo ships the fix in-repo — an overlay plus
+two `--hf-overrides` flags — which brings the y-slope to 0.981 and the mean error to 0.8 %,
+verified with a coordinate probe rather than by eye. A deployment that merely serves the model
+has the defect live, and its vision gate still passes, because describe / count / OCR are not
+perturbed by it.
+
+Beyond the fix, this is the reproducible, verified deployment: the image is pinned by digest
+and the weights by revision, every serving knob is explained, and a five-gate battery
+(fingerprints, a 14-check basics battery, six vision probes, a 130 s clock soak that requires
+≥ 2400 MHz, and NVRM / host-memory accounting) must pass on every start before the server is
+declared up. Independent probes are included for re-running against a live endpoint.
 
 ## Performance
 
-Measured on 2× DGX Spark (GB10, 128 GB unified each) over the direct 200 Gb/s link.
-Client on a third machine; nothing benchmarked on the servers themselves.
+Measured on the deployed configuration (`GPU_UTIL 0.924`, NCCL pinned-buffer reclaim, KV pool
+**4,682,729 tokens** = 4.47× the full 1M context), TP=2, client on a third machine.
 
-**Decode throughput vs concurrency** (pp 2048 / tg 128, 3 runs each). Concurrency scales
-decode well at short context. At 64K the cost is not decode — it is that **prefills
-serialise**, so every request waits for the one before it to finish prefilling:
+**The honest headline — single stream, natural text, the forum-standard shape
+(1024 in / 4096 out): 60.7 tok/s.** The same shape on random token IDs reads 39.4 — random
+tokens cannot be speculated, so they understate decode by ~55–69 %.
 
-| Streams | Depth 0 agg tok/s | Depth 0 peak | 64K agg tok/s | 64K peak | 64K TTFR (first→last req) |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 41.7 | 52 | 43.3 | 51 | 36 s |
-| 2 | 58.7 | 76 | 6.6 | 73 | 37 – 73 s |
-| 4 | 60.5 | 111 | 4.6 | 77 | 37 – 145 s |
-| 8 | 73.6 | 162 | 3.9 | 74 | 37 – 292 s |
-| 16 | **81.0** | **230** | 3.7 | 74 | 37 – **584 s** |
-
-Read the **peak** column, not the aggregate. Peak decode throughput *rises* with
-concurrency at 64K too (51 → 77 tok/s, saturating near 4 streams) — the engine decodes
-fine. The aggregate is low because a 64K cell is ~95 % prefill: 16 requests carry
-1.08 M prefill tokens against 2 K decode tokens.
-
-The serialisation is exact. `16 × 67,584 tokens ÷ 1,852 tok/s = 583.9 s`, and the
-measured worst TTFR is **584.0 s**: each prefill runs to completion before the next
-begins. Prefill rate itself is flat (~1,850 tok/s) at every concurrency level; single
-stream at depth 0 manages 2,453 tok/s only because it has no queue behind it.
-
-**This is very likely tunable — and worth testing on your hardware.** `LPT`
-(`--long-prefill-token-threshold`) is unset in `config/R-baseline.env`, so a long prefill
-receives the entire per-step budget and cannot be interleaved. The scheduler caps new
-prefill tokens per step at `min(MNBT, LPT)`, so setting `LPT` below `MNBT` should chunk
-long prefills and spread first-token latency rather than stacking it.
-
-To be explicit about the limits of what we measured: the serialisation and the TTFR
-spread above are measured; **the fix is inferred, not measured at this concurrency and
-depth.** The mechanism is from the scheduler implementation, and `LPT=1024` was measured
-on this stack cutting worst-case short-request latency during a 100K prefill from 39.9 s
-to 1.9 s — a different scenario. If you set `LPT`, re-measure.
-
-**Practical guidance:** size a long-context deployment by stream count, not aggregate
-throughput, and set `LPT` deliberately for your latency profile.
-
-**Prefill and decode vs context depth** (single stream, 3 runs each):
-
-| Context depth | Prefill tok/s | Decode tok/s | Time to first token |
-|---:|---:|---:|---:|
-| 0 | **2,376** | **44.5** | 1.1 s |
-| 16,384 | 1,962 | 46.9 | 9.6 s |
-| 65,536 | 1,845 | 46.7 | 36.9 s |
-| 262,144 | 1,538 | 43.6 | 172.0 s |
-| 524,288 | 1,234 | 34.3 | **428.6 s** |
-
-Decode is essentially flat to 256K context. Prefill degrades gracefully. A 512K-token
-prompt costs **7.1 minutes** to first token.
-
-**Quality** (tool-eval-bench v2.7.0, hard mode, 88 scenarios × 3 trials):
-
-| Run | Score | Points | Errors |
-|---|---:|---:|---:|
-| Sequential | **90**/100 | 158/176 | 0 |
-| `--parallel 6` | **89**/100 | 157/176 | 0 |
-
-| Benchmark | Result |
+| Metric | Value |
 |---|---|
-| GSM8K | **95.5 %** (191/200) |
-| IFEval | **75.8 %** prompt (410/541), **78.9 %** instruction (658/834) |
-| Needle-in-a-haystack, ≤81K | **100 %** (20/20), all positions |
-| **Needle-in-a-haystack, 1,022K context** | **100 %** (6/6) — start, middle and end of a 1.04M-token haystack |
-| Speculative decoding (DSpark k=3) | 46.5–69.9 % acceptance, 2.4–3.0× speedup ceiling |
+| Single stream, 1024 in / 4096 out | **60.7 tok/s** (TTFT 225 ms, TPOT 16.4 ms) |
+| Single stream, 1024 in / 256 out | 40.8 tok/s |
+| Aggregate, 16 streams, 1K-token prompts | **186.5 tok/s** (4.6× scaling from 1) |
+| Aggregate, 16 streams, 8K-token prompts | 172.1 tok/s |
+| Time to first token, 58 → 7,200 prompt tokens | **~300 ms, flat** |
+| Prefill rate | 2,471 tok/s (`vllm bench`), 2,596 tok/s (depth-0 llama-benchy) |
+| KV pool | **4,682,729 tokens** (4.47× the full context) |
 
-**Serving envelope:** KV pool **3,785,457 tokens** — 3.60× concurrency at full 1M context.
+**Quality** (model metrics, independent of serving config): tool-eval-bench hard mode
+**90/100** (3 trials, 158/176 points, 0 errors); GSM8K **95.5 %**; IFEval **75.8 %**
+prompt-level; needle-in-a-haystack **100 %** at 1,046,528 tokens (start, middle, end).
+DSpark speculative decoding acceptance 46.5–69.9 %, a 2.4–3.0× speedup ceiling.
 
-Full methodology and raw data: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+**The one thing to know about long context.** Prefill rate is roughly flat (~1,800–2,500 tok/s),
+but a long prefill consumes most of the per-step budget, so concurrent long-context requests
+queue behind it. Single-stream decode is context-independent to ~262K; a 524K-token prompt
+costs **7.1 min to first token**, and a cold 1M-token prefill **~17 min**. The deployed profile
+sets `LPT` to reserve a small per-step budget for short requests. Size a long-context
+deployment by stream count, not aggregate throughput.
 
----
+Full methodology, raw data, and the depth/concurrency grids:
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-## Requirements
+## What you need
 
 | | |
 |---|---|
 | Nodes | 2× NVIDIA DGX Spark (GB10), 128 GB unified memory each |
-| Interconnect | Direct ConnectX-7 link between them (RoCE), port-to-port |
-| OS | DGX OS / Ubuntu 24.04, kernel `6.17.0-1026-nvidia`, driver `580.173.02` |
+| Interconnect | Direct ConnectX-7 RoCE link between them, port-to-port |
+| OS / driver | DGX OS (Ubuntu 24.04), kernel `6.17.0-1026-nvidia`, driver `580.173.02` |
 | Disk | ~165 GB per node for the weights (each node holds the full set) |
 | Docker | present by default on DGX OS |
 
-Both nodes load the same weights — tensor parallelism shards *memory*, not disk.
-
----
+Plus a registry-published image (~24 GB) and the weights (~165 GB). First boot to a healthy
+server is **6–10 minutes** (weights load, then memory profiling and CUDA-graph capture).
 
 ## Quick start
 
-On **both** nodes, unless stated otherwise. Replace `HEAD` and `WORKER` with your
-two hostnames and `USER` with your account.
-
-**1. Pull and pin the image.** Registry-published, pinned by digest:
+Run on **both** nodes unless stated. `HEAD` / `WORKER` are your two hostnames; `USER` your
+account. `HEAD` and `WORKER` must `ssh` each other passwordlessly — the launcher drives the
+worker over SSH.
 
 ```bash
+# 1. Pull the image (pinned by digest) and tag it
 IMAGE="0rand/vllm_spark_dsv4-0.29-b12x@sha256:85eb91eec0e7a70c7c287ec04c9699f9604ebbd90b15b6b370104b60b605be18"
 docker pull "$IMAGE"
-docker tag  "$IMAGE" stack029/orand:85eb91ee
-```
+docker tag "$IMAGE" stack029/orand:85eb91ee
 
-**2. Fetch the weights** (~165 GB) into the local HuggingFace cache:
-
-```bash
+# 2. Fetch the weights into the local HF cache (each node holds the full set)
 export HF_HUB_DISABLE_XET=1
 hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
   --revision 86f746b36186f0e567729a5c06a8c918caba82a9
-```
 
-Download once, then `rsync` to the peer over the direct link. Pin the revision — the
-repo is updated in place, and an unpinned `main` will point at a snapshot you do not have.
-
-**3. Install the stack** on the head node:
-
-```bash
-git clone <this repo> && cd dsv4-flash-2x-spark-deployment
+# 3. Install and start (install runs on the head node)
+git clone <this repo> && cd <this repo>
 HEAD=spark1 WORKER=spark2 SSH_USER=$USER ./supervision/install.sh
-```
-
-**4. Serve it.** The launcher runs preflight → launch → health → gates:
-
-```bash
 sudo systemctl start stack029-vllm
-journalctl -u stack029-vllm -f          # ~6–10 min cold to /health
-curl -s localhost:8000/v1/models | jq -r '.data[].id'
+journalctl -u stack029-vllm -f     # watch the gated boot
 ```
 
-Full walkthrough including the fan-control and Secure Boot steps:
+The installer copies the launcher, serving profile, overlays and gate battery to `~/stack029/`
+on both nodes, tags the pinned image by digest on each, and installs the systemd unit on the
+head. The launcher then runs preflight, starts the TP=2 pair, and runs the gate battery. When
+it prints `gates: PASS`, the server is up at `http://$HEAD:8000/v1`.
+
+Full walkthrough (including the fan-control and Secure Boot steps):
 [`docs/SETUP.md`](docs/SETUP.md).
 
----
-
-## Layout
+## Repository layout
 
 ```
-config/R-baseline.env       the serving profile — every knob, with rationale in comments
-supervision/
-  install.sh                deploy launcher + unit to the head node
-  stack029-launch.sh        gated launcher: preflight, launch, health, 5-gate battery, monitor
-  stack029-vllm.service.template
-overlays/                   three vLLM source files bind-mounted read-only (see docs/CONFIG.md)
-patches/
-  dsv4-mm-prefix-span.patch upstream-shaped patch the vision overlay is generated from
-verify/                     gate battery and independent probes
-benchmarks/                 raw result JSON behind docs/BENCHMARKS.md
-docs/
-  SETUP.md                  step-by-step recreation, including Secure Boot + fan control
-  CONFIG.md                 what each serving knob does and why it is set that way
-  BENCHMARKS.md             methodology, full result tables, raw data
-  TROUBLESHOOTING.md        known failure modes and what they look like
-  FAN-CONTROL.md            thermal management: fan floor curve + why it is needed
+config/          serving profile — every knob, with rationale in comments
+supervision/     install script, gated launcher, systemd unit template
+overlays/        vLLM source files bind-mounted read-only (the vision + parser fixes)
+patches/         the upstream-shaped patch the vision overlay is generated from
+verify/          gate battery and independent probes
+benchmarks/      raw result JSON behind docs/BENCHMARKS.md
+docs/            SETUP, CONFIG, BENCHMARKS, TROUBLESHOOTING, FAN-CONTROL
 ```
 
----
+## Documentation
 
-## Verification
-
-Every start runs a 5-gate battery before the server is considered up:
-
-```bash
-./supervision/stack029-launch.sh gates config/R-baseline.env   # re-run against a live server
-```
-
-1. Model fingerprints + smoke + unknown-reasoning-level handling
-2. 14-check basics battery (vision-parametrised)
-3. 6 vision probes
-4. 130 s c8 mixed soak with clock sampling (must peak ≥ 2400 MHz)
-5. NVRM allocation-failure counts and host-memory floor (recorded)
-
-Any gate failure stops the cluster. Independent probes in `verify/` can be run
-against a live endpoint at any time.
-
----
-
-## Known issues
-
-Summarised here, detailed in [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md):
-
-- **Full-context requests are heavy.** A 1M-token prefill sustains the board near its
-  thermal limit and holds ~1M of the 3.79M-token KV pool. See `docs/FAN-CONTROL.md`.
-- **Post-reboot firmware clock pinning.** After some reboots the GPU holds ~650–930 MHz
-  under load instead of ~2500 MHz, which fails the clock gate. Another reboot clears it.
-- **`expandable_segments` materially changes KV capacity** (+18 % when disabled) but
-  interacts with the prefill memory high-water mark. Rationale in `docs/CONFIG.md`.
-- **A featureless image is described wrongly** — a flat single-colour field answers
-  "White" regardless of actual colour. Structured images are read correctly.
-
----
+- [`docs/SETUP.md`](docs/SETUP.md) — recreate the stack step by step, including Secure Boot and fan control
+- [`docs/CONFIG.md`](docs/CONFIG.md) — every serving knob and why it is set that way
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — methodology, full result tables, raw data
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — failure modes we have hit and what they look like
+- [`docs/FAN-CONTROL.md`](docs/FAN-CONTROL.md) — thermal management: the fan floor curve and why it is needed
 
 ## Credits
 
-This builds on other people's work; the parts that are ours are marked as such in the
-docs.
-
 - **Model:** [deepseek-ai/DeepSeek-V4-Flash-Vision-Exp](https://huggingface.co/deepseek-ai) (MIT)
-- **Image:** [`0rand/vllm_spark_dsv4-0.29-b12x`](https://hub.docker.com/) — a registry-published
-  community build of vLLM 0.28.1rc1 (B12X lineage) with native DSV4 vision + DSpark
-- **Launch orchestration:** [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker)
-  — `launch-cluster.sh` drives the TP=2 pair
-- **Fan control:** [thewh1teagle/sparkfan](https://github.com/thewh1teagle/sparkfan) — kernel
-  gate + daemon; used unmodified except for a curve argument
-- **EC protocol reverse engineering:** [Z841973620](https://github.com/Z841973620/dgx-spark-fan-override),
-  [xXLegionBinFrogXx](https://github.com/xXLegionBinFrogXx/gb10-fan-control)
-- **Benchmarks:** [eugr/llama-benchy](https://github.com/eugr/llama-benchy) (MIT),
-  [SeraphimSerapis/tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) (MIT)
+- **Image:** [`0rand/vllm_spark_dsv4-0.29-b12x`](https://hub.docker.com/) — a registry-published community build of vLLM with native DSV4 vision + DSpark
+- **Launch orchestration:** [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) — `launch-cluster.sh` drives the TP=2 pair
+- **Fan control:** [thewh1teagle/sparkfan](https://github.com/thewh1teagle/sparkfan) — kernel gate + daemon, used unmodified except for a curve argument
+- **EC protocol reverse engineering:** [Z841973620](https://github.com/Z841973620/dgx-spark-fan-override), [xXLegionBinFrogXx](https://github.com/xXLegionBinFrogXx/gb10-fan-control)
+- **Benchmarks:** [eugr/llama-benchy](https://github.com/eugr/llama-benchy) (MIT), [SeraphimSerapis/tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) (MIT)
 
 ## License
 

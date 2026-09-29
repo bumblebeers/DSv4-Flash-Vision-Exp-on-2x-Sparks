@@ -1,7 +1,10 @@
 # Configuration
 
-The active profile is [`config/R-baseline.env`](../config/R-baseline.env). Every value
-below is either a knob we set deliberately or a patch we apply, with the reason.
+The active profile is [`config/R-mnbt2304-nccl-u924.env`](../config/R-mnbt2304-nccl-u924.env).
+Every value below is either a knob we set deliberately or a patch we apply, with the reason.
+The reference profile [`config/R-baseline.env`](../config/R-baseline.env) is the known-good
+starting point; the deployed profile adds the NCCL reclaim and a higher GPU allocation on top
+of it.
 
 Read the profile itself too — it carries the same rationale inline, so the file is
 self-explanatory on the node.
@@ -12,10 +15,10 @@ self-explanatory on the node.
 
 | Setting | Value | Why |
 |---|---|---|
-| `GPU_UTIL` | **0.88** | GPU and host share **one** 121.6 GiB pool. 0.88 asks for 107.03 GiB (79.5 weights + 21.3 KV), leaving the host ~14.6 GiB nominally. Higher does not boot: the engine checks free device memory at startup and 0.92 fails cleanly with `Free memory on device cuda:0 (110.48/121.63 GiB) … less than desired`. The practical ceiling is ≈0.908. |
+| `GPU_UTIL` | **0.924** | GPU and host share **one** 121.6 GiB pool. 0.924 is the top of a validated ladder (0.899 → 0.924, 2,400 requests, 0 failures) that spends the NCCL-reclaimed memory on KV. Higher boots are possible, but 0.929 was rejected for spending the last ~800 MB of headroom. The ceiling before the NCCL reclaim was ≈0.908, where the engine failed cleanly with `Free memory on device cuda:0 (110.48/121.63 GiB) … less than desired`. |
 | `MAX_NUM_SEQS` | **16** | Concurrency. Each running sequence submits `k+1 = 4` verify rows under DSpark, so 16 sequences = 64 rows — exactly FlashInfer's decode-dispatch boundary (`_DECODE_MAX_TOKENS = 64`; above it, requests route to the prefill orchestrator instead of the dedicated decode kernels). |
-| `MAX_BATCHED` | **2048** | `max_num_batched_tokens`. For this hybrid sliding-window model the batch budget is counted **in the KV pool sizing**, so lowering it *increases* the pool. 4096 → 2048 bought ≈ +0.9 M tokens of pool. |
-| `_LPT_` (`--long-prefill-token-threshold`) | **unset** | The effective per-step prefill cap is `min(MNBT, LPT)`. Setting `LPT` below `MNBT` reserves budget for short requests arriving during a long prefill — at the cost of ~10–20 % on the long prefill itself, and of KV pool. Left unset here; set it to ~1024 if you serve interactive traffic alongside long prompts. |
+| `MAX_BATCHED` | **2304** | `max_num_batched_tokens`. For this hybrid sliding-window model the batch budget is counted **in the KV pool sizing**, so lowering it *increases* the pool. 4096 → 2048 bought ≈ +0.9 M tokens of pool; 2304 is the deployed value paired with `LPT` below. |
+| `LPT` (`--long-prefill-token-threshold`) | **2048** | The effective per-step prefill cap is `min(MNBT, LPT)` = 2048, leaving 256 tokens of budget each step for other requests to decode or prefill. This spreads first-token latency when a long prefill is running. Set it to ~1024 for a more aggressive fairness reserve; leave it unset to give a long prefill the whole budget. |
 | `K` | **3** | DSpark speculative tokens. Matches the model's `num_nextn_predict_layers`. |
 | `DRAFT_METHOD` | `probabilistic` | DSpark drafting mode. |
 | `EFFORT` | `high` | Default reasoning effort. Per-request overrides work. |
@@ -24,6 +27,30 @@ self-explanatory on the node.
 | `FORCE_A16` | **1** | `VLLM_B12X_MOE_FP4_FORCE_A16`. Required for the MXFP4 MoE path on this build. |
 | `OVERRIDE_GEN` | `temperature 1.0, top_p 0.95` | The model card's agentic recommendation, applied server-side so clients need not send it. |
 | `EP` | **0** | Expert parallelism off — TP=2 only. |
+
+### NCCL pinned-buffer reclaim
+
+The one capacity lever that costs nothing. Four NCCL transport knobs in `EXTRA_ENV`:
+
+```
+NCCL_BUFFSIZE=1048576 NCCL_LL128_BUFFSIZE=262144 NCCL_PROTO=^LL128 NCCL_MAX_NCHANNELS=8
+```
+
+NCCL's default connection buffers are 9.19 MiB on the default channel count using
+Simple+LL128+LL, and they are pinned (unreclaimable). These knobs allocate 1 MiB buffers on
+8 channels using Simple+LL instead.
+
+Measured on the live pair: worker `VLLM::Worker_TP` VmPin went from **2,495,520 kB to
+68,232 kB on both ranks — −2.31 GiB/node** — byte-identical across two independently loading
+ranks, which is what identifies it as a static allocation rather than workload-dependent.
+The gate battery passed, gate-4 clock peaks were unaffected (2509/2528 MHz), and decode
+throughput did not regress (c1 +8.0 %, c16 +4.1 % on the comparable harness).
+
+`GPU_UTIL 0.924` then spends that reclaimed memory on KV cache: the pool rose from
+3,756,959 to **4,682,729 tokens (+24.6 %)**, 4.466× the full 1M context.
+
+Plain integers, not byte suffixes, because the profile is sourced by bash and re-split on
+whitespace by the launcher.
 
 ## Allocator
 
@@ -41,12 +68,14 @@ it trades against something real. vLLM sizes the KV pool as
 segments to fight fragmentation, and retains freed memory inside them rather than
 returning it, so the profiler measures a larger non-KV footprint and less is left for KV.
 
+On the reference (0.88) config, the measured difference was:
+
 | `expandable_segments` | KV pool | Note |
 |---|---:|---|
 | `True` | 3,401,076 | less fragmentation-prone; **what the reference deployment ran** |
 | `False` | 4,017,245 | **+616,169 tokens (+18.1 %)**, more fragmentation-prone |
 
-We run `True`. The +18 % is real and measured, but `False` is the more
+The deployed config runs `True`. The +18 % is real and measured, but `False` is the more
 fragmentation-prone mode, and fragmentation is the documented mechanism behind the
 prefill memory high-water mark on this stack: with the native allocator a freed
 smaller block cannot serve the next larger request, so *reserved* grows with prompt
@@ -114,12 +143,13 @@ Measured and rejected, recorded so you do not have to re-derive them:
 | `--kv-cache-dtype` other than `fp8` | fp8 costs essentially nothing in throughput here and sizes the pool for the full 1M context. |
 | SM12x `o_proj` repair patches | Already baked into this image. Verified: the `o_proj.py` recipe and 3-D reshape are present. |
 | FlashInfer "resolved plan" patches | Target a newer FlashInfer than this image's 0.6.18 (flat `_sparse_mla_sm120.py`). The boot completes `FULL_AND_PIECEWISE` capture without them. |
+| `GPU_UTIL` above 0.924 | The ladder ended at 0.924 with no failure found. 0.929 also passed but was rejected for spending the last ~800 MB of headroom (gate floor 0.78 GiB, 99.8 % of free-at-startup memory). |
 
 ## Environment variables the launcher sets
 
 `HF_HUB_OFFLINE=1`, `HF_HUB_DISABLE_XET=1`, `VLLM_PREFIX_CACHE_RETENTION_INTERVAL`,
-`VLLM_B12X_MOE_FP4_FORCE_A16`, `PYTORCH_CUDA_ALLOC_CONF`, and the two overlay mounts.
-Reproduce the exact command for any boot from its record:
+`VLLM_B12X_MOE_FP4_FORCE_A16`, `PYTORCH_CUDA_ALLOC_CONF`, the four `NCCL_*` transport knobs,
+and the two overlay mounts. Reproduce the exact command for any boot from its record:
 
 ```
 ~/stack029/records/<timestamp>__<profile>/serve.sh
@@ -194,7 +224,7 @@ non-empty strings here would **override** the parser, not enable anything.
 
 | Flag | What it does | Provenance |
 |---|---|---|
-| `--skip-mm-profiling` | Omits the multimodal encoder from the memory-profiling pass, so the KV pool is not reduced by the vision encoder's peak. A capacity/margin trade — this is part of why the pool reaches 3.86 M tokens. | vendor sample |
+| `--skip-mm-profiling` | Omits the multimodal encoder from the memory-profiling pass, so the KV pool is not reduced by the vision encoder's peak. A capacity/margin trade — part of why the pool reaches 4.68 M tokens. | vendor sample |
 | `--enable-prompt-tokens-details` | Adds the prompt-token breakdown to `usage`, which is where `multimodal_tokens` comes from — useful for confirming a model actually conditioned on an image. | vendor sample |
 | `VLLM_USE_V2_MODEL_RUNNER=1` | Selects the V2 model runner (tri-state in `envs.py`; `1` forces it on). **This is load-bearing for our vision fix** — the overlay patches `vllm/v1/worker/gpu/model_states/default.py`, a V2-runner file. Turning it off would silently disable the mm-prefix-span repair. | image |
 | `VLLM_USE_BREAKABLE_CUDAGRAPH=1` | Enables `compilation/breakable_cudagraph.py` (default `False`). Boot log confirms `Breakable CUDA graph enabled`. | image |

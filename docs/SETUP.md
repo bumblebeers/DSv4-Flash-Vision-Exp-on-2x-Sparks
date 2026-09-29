@@ -100,7 +100,7 @@ curl -s localhost:8000/v1/models | jq -r '.data[].id'
 curl -s localhost:8000/health -o /dev/null -w '%{http_code}\n'
 ```
 
-Expected KV pool is around **3.78M tokens** (3.60× concurrency at 1M context).
+Expected KV pool is around **4.68M tokens** (4.47× concurrency at 1M context).
 It varies a few percent boot to boot — that is the CUDA-graph memory profiler, not a fault.
 
 ### Switching models
@@ -207,7 +207,7 @@ both fans well above that. To hand control back to the EC: `sparkfan auto`.
 ## 6. Verify
 
 ```bash
-cd ~/stack029 && ./stack029-launch.sh gates profiles/R-baseline.env
+cd ~/stack029 && ./stack029-launch.sh gates profiles/R-mnbt2304-nccl-u924.env
 ```
 
 Runs the full 5-gate battery against the live server. Independent probes:

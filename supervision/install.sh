@@ -26,7 +26,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE"/{profiles,overlays,gates,records}
 cp "$HERE/stack029-launch.sh"    "$STAGE/"
-cp "$REPO/config/R-baseline.env" "$STAGE/profiles/"
+cp "$REPO/config/R-mnbt2304-nccl-u924.env" "$STAGE/profiles/"
 cp "$REPO"/overlays/*.py         "$STAGE/overlays/"
 cp "$REPO"/verify/gate-probes.py "$REPO"/verify/vision-probes.py \
    "$REPO"/verify/basics-check-vision.py "$REPO"/verify/soak-probe.py "$STAGE/gates/"

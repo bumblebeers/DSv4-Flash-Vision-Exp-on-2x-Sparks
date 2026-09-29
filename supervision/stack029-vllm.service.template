@@ -31,7 +31,7 @@ Type=exec
 User=__USER__
 WorkingDirectory=__HOME__/stack029
 Environment=HOME=__HOME__
-ExecStart=__HOME__/stack029/stack029-launch.sh serve __HOME__/stack029/profiles/R-baseline.env
+ExecStart=__HOME__/stack029/stack029-launch.sh serve __HOME__/stack029/profiles/R-mnbt2304-nccl-u924.env
 ExecStop=__HOME__/stack029/stack029-launch.sh stop
 Restart=on-failure
 RestartSec=180

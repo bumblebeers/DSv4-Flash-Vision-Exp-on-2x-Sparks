@@ -6,8 +6,8 @@ vllm serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
     --trust-remote-code --revision 86f746b36186f0e567729a5c06a8c918caba82a9 --tokenizer-revision 86f746b36186f0e567729a5c06a8c918caba82a9 --code-revision 86f746b36186f0e567729a5c06a8c918caba82a9 \
     --tensor-parallel-size 2 \
     --kv-cache-dtype fp8 --block-size 256 \
-    --max-model-len 1048576 --max-num-seqs 16 --max-num-batched-tokens 2048 \
-    --gpu-memory-utilization 0.88 \
+    --max-model-len 1048576 --max-num-seqs 16 --max-num-batched-tokens 2304 --long-prefill-token-threshold 2048 \
+    --gpu-memory-utilization 0.924 \
     --enable-prefix-caching --enable-chunked-prefill --enable-prompt-tokens-details \
     --skip-mm-profiling --limit-mm-per-prompt '{"image": 8}' \
     --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice \
